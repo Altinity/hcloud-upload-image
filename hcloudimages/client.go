@@ -90,6 +90,35 @@ type UploadOptions struct {
 	DebugSkipResourceCleanup bool
 }
 
+type ExportOptions struct {
+	Cmd     string
+	ImageID int64
+
+	// Architecture should match the architecture of the Image. This decides if the Snapshot can later be
+	// used with [hcloud.ArchitectureX86] or [hcloud.ArchitectureARM] servers.
+	//
+	// Internally this decides what server type is used for the temporary server.
+	//
+	// Optional if [UploadOptions.ServerType] is set.
+	Architecture hcloud.Architecture
+
+	// ServerType can be optionally set to override the default server type for the architecture.
+	// Situations where this makes sense:
+	//
+	//   - Your image is larger than the root disk of the default server types.
+	//   - The default server type is no longer available, or not temporarily out of stock.
+	ServerType *hcloud.ServerType
+
+	// Labels will be added to the resulting image (snapshot). Use these to filter the image list if you
+	// need to identify the image later on.
+	//
+	// We also always add a label `apricote.de/created-by=hcloud-image-upload` ([CreatedByLabel], [CreatedByValue]).
+	Labels map[string]string
+
+	// DebugSkipResourceCleanup will skip the cleanup of the temporary SSH Key and Server.
+	DebugSkipResourceCleanup bool
+}
+
 type Compression string
 
 const (
@@ -355,6 +384,214 @@ func (s *Client) Upload(ctx context.Context, options UploadOptions) (*hcloud.Ima
 
 	image := createImageResult.Image
 	logger.InfoContext(ctx, "# Image was created", "image", image.ID)
+
+	// Resource cleanup is happening in `defer`
+	return image, nil
+}
+
+// Export
+func (s *Client) Export(ctx context.Context, options ExportOptions) (*hcloud.Image, error) {
+	logger := contextlogger.From(ctx).With(
+		"library", "hcloudimages",
+		"method", "export",
+	)
+
+	id, err := randomid.Generate()
+	if err != nil {
+		return nil, err
+	}
+	logger = logger.With("run-id", id)
+	// For simplicity, we use the name random name for SSH Key + Server
+	resourceName := resourcePrefix + id
+	labels := labelutil.Merge(DefaultLabels, options.Labels)
+
+	// 1. Create SSH Key
+	logger.InfoContext(ctx, "# Step 1: Generating SSH Key")
+	privateKey, publicKey, err := sshutils.GenerateKeyPair()
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate temporary ssh key pair: %w", err)
+	}
+
+	key, _, err := s.c.SSHKey.Create(ctx, hcloud.SSHKeyCreateOpts{
+		Name:      resourceName,
+		PublicKey: string(publicKey),
+		Labels:    labels,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to submit temporary ssh key to API: %w", err)
+	}
+	logger.DebugContext(ctx, "Uploaded ssh key", "ssh-key-id", key.ID)
+	defer func() {
+		// Cleanup SSH Key
+		if options.DebugSkipResourceCleanup {
+			logger.InfoContext(ctx, "Cleanup: Skipping cleanup of temporary ssh key")
+			return
+		}
+
+		logger.InfoContext(ctx, "Cleanup: Deleting temporary ssh key")
+
+		_, err := s.c.SSHKey.Delete(ctx, key)
+		if err != nil {
+			logger.WarnContext(ctx, "Cleanup: ssh key could not be deleted", "error", err)
+			// TODO
+		}
+	}()
+
+	// 2. Create Server
+	logger.InfoContext(ctx, "# Step 2: Creating Server")
+	var serverType *hcloud.ServerType
+	if options.ServerType != nil {
+		serverType = options.ServerType
+	} else {
+		var ok bool
+		serverType, ok = serverTypePerArchitecture[options.Architecture]
+		if !ok {
+			return nil, fmt.Errorf("unknown architecture %q, valid options: %q, %q", options.Architecture, hcloud.ArchitectureX86, hcloud.ArchitectureARM)
+		}
+	}
+	var image *hcloud.Image
+	if options.ImageID != 0 {
+		image = &hcloud.Image{ID: options.ImageID}
+	} else {
+		return nil, fmt.Errorf("image id is requred")
+	}
+
+	logger.DebugContext(ctx, "creating server with config",
+		"image", image,
+		"location", defaultLocation.Name,
+		"serverType", serverType.Name,
+	)
+	serverCreateResult, _, err := s.c.Server.Create(ctx, hcloud.ServerCreateOpts{
+		Name:       resourceName,
+		ServerType: serverType,
+
+		// Not used, but without this the user receives an email with a password for every created server
+		SSHKeys: []*hcloud.SSHKey{key},
+
+		// We need to enable rescue system first
+		StartAfterCreate: hcloud.Ptr(false),
+		// Image will never be booted, we only boot into rescue system
+		Image:    image,
+		Location: defaultLocation,
+		Labels:   labels,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("creating the temporary server failed: %w", err)
+	}
+	logger = logger.With("server", serverCreateResult.Server.ID)
+	logger.DebugContext(ctx, "Created Server")
+
+	logger.DebugContext(ctx, "waiting on actions")
+	err = s.c.Action.WaitFor(ctx, append(serverCreateResult.NextActions, serverCreateResult.Action)...)
+	if err != nil {
+		return nil, fmt.Errorf("creating the temporary server failed: %w", err)
+	}
+	logger.DebugContext(ctx, "actions finished")
+
+	server := serverCreateResult.Server
+	defer func() {
+		// Cleanup Server
+		if options.DebugSkipResourceCleanup {
+			logger.InfoContext(ctx, "Cleanup: Skipping cleanup of temporary server")
+			return
+		}
+
+		logger.InfoContext(ctx, "Cleanup: Deleting temporary server")
+
+		_, _, err := s.c.Server.DeleteWithResult(ctx, server)
+		if err != nil {
+			logger.WarnContext(ctx, "Cleanup: server could not be deleted", "error", err)
+		}
+	}()
+
+	// 3. Activate Rescue System
+	logger.InfoContext(ctx, "# Step 3: Activating Rescue System")
+	enableRescueResult, _, err := s.c.Server.EnableRescue(ctx, server, hcloud.ServerEnableRescueOpts{
+		Type:    defaultRescueType,
+		SSHKeys: []*hcloud.SSHKey{key},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("enabling the rescue system on the temporary server failed: %w", err)
+	}
+
+	logger.DebugContext(ctx, "rescue system requested, waiting on action")
+
+	err = s.c.Action.WaitFor(ctx, enableRescueResult.Action)
+	if err != nil {
+		return nil, fmt.Errorf("enabling the rescue system on the temporary server failed: %w", err)
+	}
+	logger.DebugContext(ctx, "action finished, rescue system enabled")
+
+	// 4. Boot Server
+	logger.InfoContext(ctx, "# Step 4: Booting Server")
+	powerOnAction, _, err := s.c.Server.Poweron(ctx, server)
+	if err != nil {
+		return nil, fmt.Errorf("starting the temporary server failed: %w", err)
+	}
+
+	logger.DebugContext(ctx, "boot requested, waiting on action")
+
+	err = s.c.Action.WaitFor(ctx, powerOnAction)
+	if err != nil {
+		return nil, fmt.Errorf("starting the temporary server failed: %w", err)
+	}
+	logger.DebugContext(ctx, "action finished, server is booting")
+
+	// 5. Open SSH Session
+	logger.InfoContext(ctx, "# Step 5: Opening SSH Connection")
+	signer, err := ssh.ParsePrivateKey(privateKey)
+	if err != nil {
+		return nil, fmt.Errorf("parsing the automatically generated temporary private key failed: %w", err)
+	}
+
+	sshClientConfig := &ssh.ClientConfig{
+		User: "root",
+		Auth: []ssh.AuthMethod{
+			ssh.PublicKeys(signer),
+		},
+		// There is no way to get the host key of the rescue system beforehand
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         defaultSSHDialTimeout,
+	}
+
+	// the server needs some time until its properly started and ssh is available
+	var sshClient *ssh.Client
+
+	err = control.Retry(
+		contextlogger.New(ctx, logger.With("operation", "ssh")),
+		10,
+		func() error {
+			var err error
+			logger.DebugContext(ctx, "trying to connect to server", "ip", server.PublicNet.IPv4.IP)
+			sshClient, err = ssh.Dial("tcp", server.PublicNet.IPv4.IP.String()+":ssh", sshClientConfig)
+			return err
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to ssh into temporary server: %w", err)
+	}
+	defer sshClient.Close()
+
+	// 6. SSH On Server: Run export command
+	logger.InfoContext(ctx, "# Step 6: Running export command")
+	cmd := options.Cmd
+
+	logger.DebugContext(ctx, "running export command", "cmd", cmd)
+
+	output, err := sshsession.Run(sshClient, cmd, nil)
+	logger.InfoContext(ctx, "# Step 6: Finished executing export command")
+	logger.DebugContext(ctx, string(output))
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute export command: %w", err)
+	}
+
+	// 7. SSH On Server: Shutdown
+	logger.InfoContext(ctx, "# Step 7: Shutting down server")
+	_, err = sshsession.Run(sshClient, "shutdown now", nil)
+	if err != nil {
+		// TODO Verify if shutdown error, otherwise return
+		logger.WarnContext(ctx, "shutdown returned error", "err", err)
+	}
 
 	// Resource cleanup is happening in `defer`
 	return image, nil
