@@ -29,7 +29,13 @@ func Retry(ctx context.Context, maxTries int, f func() error) error {
 		if err != nil {
 			sleep := backoffFunc(try)
 			logger.DebugContext(ctx, "operation failed, waiting before trying again", "try", try, "backoff", sleep)
-			time.Sleep(sleep)
+			t := time.NewTimer(sleep)
+			select {
+			case <-t.C:
+			case <-ctx.Done():
+				t.Stop()
+				return ctx.Err()
+			}
 			continue
 		}
 
