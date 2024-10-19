@@ -25,7 +25,7 @@ const (
 	CreatedByLabel = "apricote.de/created-by"
 	CreatedByValue = "hcloud-upload-image"
 
-	resourcePrefix = "hcloud-upload-image-"
+	defaultResourcePrefix = "hcloud-upload-image-"
 )
 
 var (
@@ -83,7 +83,7 @@ type UploadOptions struct {
 	// Labels will be added to the resulting image (snapshot). Use these to filter the image list if you
 	// need to identify the image later on.
 	//
-	// We also always add a label `apricote.de/created-by=hcloud-image-upload` ([CreatedByLabel], [CreatedByValue]).
+	// We also always add a label `apricote.de/created-by=hcloud-image-upload` ([DefaultLabels]).
 	Labels map[string]string
 
 	// DebugSkipResourceCleanup will skip the cleanup of the temporary SSH Key and Server.
@@ -101,14 +101,45 @@ const (
 	// zip,zstd
 )
 
+type options struct {
+	resourcePrefix string
+	resourceLabels map[string]string
+}
+
+type Option func(o *options)
+
+func WithResourcePrefix(v string) Option {
+	return func(o *options) {
+		o.resourcePrefix = v
+	}
+}
+
+func WithResourceLabels(v map[string]string) Option {
+	return func(o *options) {
+		o.resourceLabels = v
+	}
+}
+
 // NewClient instantiates a new client. It requires a working [*hcloud.Client] to interact with the Hetzner Cloud API.
-func NewClient(c *hcloud.Client) *Client {
+func NewClient(c *hcloud.Client, opts ...Option) *Client {
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
+	if o.resourcePrefix == "" {
+		o.resourcePrefix = defaultResourcePrefix
+	}
+	if len(o.resourceLabels) == 0 {
+		o.resourceLabels = DefaultLabels
+	}
 	return &Client{
-		c: c,
+		options: o,
+		c:       c,
 	}
 }
 
 type Client struct {
+	options
 	c *hcloud.Client
 }
 
@@ -131,8 +162,7 @@ func (s *Client) Upload(ctx context.Context, options UploadOptions) (*hcloud.Ima
 	}
 	logger = logger.With("run-id", id)
 	// For simplicity, we use the name random name for SSH Key + Server
-	resourceName := resourcePrefix + id
-	labels := labelutil.Merge(DefaultLabels, options.Labels)
+	resourceName := s.resourcePrefix + id
 
 	// 1. Create SSH Key
 	logger.InfoContext(ctx, "# Step 1: Generating SSH Key")
@@ -144,7 +174,7 @@ func (s *Client) Upload(ctx context.Context, options UploadOptions) (*hcloud.Ima
 	key, _, err := s.c.SSHKey.Create(ctx, hcloud.SSHKeyCreateOpts{
 		Name:      resourceName,
 		PublicKey: string(publicKey),
-		Labels:    labels,
+		Labels:    s.resourceLabels,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to submit temporary ssh key to API: %w", err)
@@ -196,7 +226,7 @@ func (s *Client) Upload(ctx context.Context, options UploadOptions) (*hcloud.Ima
 		// Image will never be booted, we only boot into rescue system
 		Image:    defaultImage,
 		Location: defaultLocation,
-		Labels:   labels,
+		Labels:   s.resourceLabels,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("creating the temporary server failed: %w", err)
@@ -340,7 +370,7 @@ func (s *Client) Upload(ctx context.Context, options UploadOptions) (*hcloud.Ima
 	createImageResult, _, err := s.c.Server.CreateImage(ctx, server, &hcloud.ServerCreateImageOpts{
 		Type:        hcloud.ImageTypeSnapshot,
 		Description: options.Description,
-		Labels:      labels,
+		Labels:      labelutil.Merge(DefaultLabels, options.Labels),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create snapshot: %w", err)
@@ -364,14 +394,14 @@ func (s *Client) Upload(ctx context.Context, options UploadOptions) (*hcloud.Ima
 // Upload tries to clean up any temporary resources it created at runtime, but might fail at any point.
 // You can then use this command to make sure that all temporary resources are removed from your project.
 //
-// This method tries to delete any server or ssh keys that match the [DefaultLabels]
+// This method tries to delete any server or ssh keys that match the [WithResourceLabels].
 func (s *Client) CleanupTempResources(ctx context.Context) error {
 	logger := contextlogger.From(ctx).With(
 		"library", "hcloudimages",
 		"method", "cleanup",
 	)
 
-	selector := labelutil.Selector(DefaultLabels)
+	selector := labelutil.Selector(s.resourceLabels)
 	logger = logger.With("selector", selector)
 
 	logger.InfoContext(ctx, "# Cleaning up Servers")
